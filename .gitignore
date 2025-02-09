@@ -41,3 +41,6 @@ __debug_bin
 # 项目特定的临时文件
 /tmp/
 /temp/
+
+# 检测报告目录
+outputs/
