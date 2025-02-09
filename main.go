@@ -1,17 +1,19 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
-	"encoding/json"
-	"path/filepath"
 )
 
 type LogLevel int
@@ -64,6 +66,7 @@ const (
 	LayerGateway
 	LayerDNS
 	LayerTCP
+	LayerISP
 	LayerInternational
 )
 
@@ -77,6 +80,8 @@ func (l NetworkLayer) String() string {
 		return "DNS解析层"
 	case LayerTCP:
 		return "TCP连接层"
+	case LayerISP:
+		return "运营商检测层"
 	case LayerInternational:
 		return "国际互联网层"
 	default:
@@ -91,6 +96,12 @@ type NetworkStatus struct {
 	LocalIP          string
 	Gateway          string
 	DNSServers       []string
+	ISPInfo          struct {
+		PublicIP    string
+		ISPName     string
+		ISPOrg      string
+		CountryCode string
+	}
 	ConnectionIssues []string
 	Latency          map[string]time.Duration
 	DetailedChecks   map[string][]DiagnosticResult
@@ -393,6 +404,84 @@ func (nc *NetworkChecker) checkTCP() LayerStatus {
 	return result
 }
 
+func (nc *NetworkChecker) checkISP() LayerStatus {
+	start := time.Now()
+	result := LayerStatus{
+		Layer:   LayerISP,
+		Details: make(map[string]interface{}),
+	}
+
+	resp, err := http.Get("https://ipapi.co/json/")
+	if err != nil {
+		result.Status = false
+		result.Error = fmt.Errorf("获取公网IP信息失败: %v", err)
+		nc.updateProgress("运营商检测", fmt.Sprintf("获取公网IP信息失败: %v", err), 85, LogError)
+		result.CheckTime = time.Since(start)
+		return result
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		result.Status = false
+		result.Error = fmt.Errorf("读取IP信息失败: %v", err)
+		nc.updateProgress("运营商检测", fmt.Sprintf("读取IP信息失败: %v", err), 85, LogError)
+		result.CheckTime = time.Since(start)
+		return result
+	}
+
+	var ipInfo struct {
+		IP          string `json:"ip"`
+		Org         string `json:"org"`
+		CountryCode string `json:"country_code"`
+	}
+
+	if err := json.Unmarshal(body, &ipInfo); err != nil {
+		result.Status = false
+		result.Error = fmt.Errorf("解析IP信息失败: %v", err)
+		nc.updateProgress("运营商检测", fmt.Sprintf("解析IP信息失败: %v", err), 85, LogError)
+		result.CheckTime = time.Since(start)
+		return result
+	}
+
+	nc.status.ISPInfo.PublicIP = ipInfo.IP
+	nc.status.ISPInfo.ISPOrg = ipInfo.Org
+	nc.status.ISPInfo.CountryCode = ipInfo.CountryCode
+
+	lowerOrg := strings.ToLower(ipInfo.Org)
+	var ispName string
+	switch {
+	case strings.Contains(lowerOrg, "telecom") || strings.Contains(lowerOrg, "电信"):
+		ispName = "中国电信"
+	case strings.Contains(lowerOrg, "unicom") || strings.Contains(lowerOrg, "联通"):
+		ispName = "中国联通"
+	case strings.Contains(lowerOrg, "mobile") || strings.Contains(lowerOrg, "移动"):
+		ispName = "中国移动"
+	default:
+		ispName = "未知运营商"
+	}
+	nc.status.ISPInfo.ISPName = ispName
+
+	result.Status = true
+	result.Description = fmt.Sprintf("运营商: %s, 公网IP: %s", ispName, ipInfo.IP)
+	result.Details["public_ip"] = ipInfo.IP
+	result.Details["isp"] = ispName
+	result.Details["org"] = ipInfo.Org
+	result.Details["country_code"] = ipInfo.CountryCode
+
+	nc.updateProgress("运营商检测",
+		fmt.Sprintf("运营商检测完成 - 状态: %s, 运营商: %s, IP: %s, 组织: %s",
+			colorize("正常", ColorGreen),
+			colorize(ispName, ColorCyan),
+			colorize(ipInfo.IP, ColorYellow),
+			colorize(ipInfo.Org, ColorCyan)),
+		85,
+		LogSuccess)
+
+	result.CheckTime = time.Since(start)
+	return result
+}
+
 func (nc *NetworkChecker) checkInternational() LayerStatus {
 	start := time.Now()
 	result := LayerStatus{
@@ -469,12 +558,10 @@ func (nc *NetworkChecker) checkInternational() LayerStatus {
 func (nc *NetworkChecker) generateReport() string {
 	var report strings.Builder
 
-	// 添加标题
 	report.WriteString(fmt.Sprintf("\n%s网络诊断报告%s\n", ColorBold, ColorReset))
 	report.WriteString(fmt.Sprintf("%s%s%s\n", ColorBold, strings.Repeat("=", 50), ColorReset))
 	report.WriteString(fmt.Sprintf("检测时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 
-	// 总体状态
 	report.WriteString(fmt.Sprintf("\n%s总体状态%s\n", ColorBold, ColorReset))
 	report.WriteString(fmt.Sprintf("%s%s%s\n", ColorCyan, strings.Repeat("-", 30), ColorReset))
 	if nc.status.FailedLayer != 0 {
@@ -485,7 +572,6 @@ func (nc *NetworkChecker) generateReport() string {
 	}
 	report.WriteString(fmt.Sprintf("最后成功层级: %s\n", colorize(nc.status.LastSuccessLayer.String(), ColorGreen)))
 
-	// 基础信息
 	report.WriteString(fmt.Sprintf("\n%s基础网络信息%s\n", ColorBold, ColorReset))
 	report.WriteString(fmt.Sprintf("%s%s%s\n", ColorCyan, strings.Repeat("-", 30), ColorReset))
 	report.WriteString(fmt.Sprintf("本地IP: %s\n", colorize(nc.status.LocalIP, ColorGreen)))
@@ -493,16 +579,15 @@ func (nc *NetworkChecker) generateReport() string {
 	if len(nc.status.DNSServers) > 0 {
 		report.WriteString(fmt.Sprintf("DNS服务器: %s\n", colorize(strings.Join(nc.status.DNSServers, ", "), ColorGreen)))
 	}
+	report.WriteString(fmt.Sprintf("运营商: %s\n", colorize(nc.status.ISPInfo.ISPName, ColorGreen)))
+	report.WriteString(fmt.Sprintf("公网IP: %s\n", colorize(nc.status.ISPInfo.PublicIP, ColorYellow)))
 
-	// 详细检测结果
 	report.WriteString(fmt.Sprintf("\n%s详细检测结果%s\n", ColorBold, ColorReset))
 	report.WriteString(fmt.Sprintf("%s%s%s\n", ColorCyan, strings.Repeat("-", 30), ColorReset))
 
 	for _, layer := range nc.status.Layers {
-		// 层级标题
 		report.WriteString(fmt.Sprintf("\n%s%s%s\n", ColorBold, layer.Layer.String(), ColorReset))
 
-		// 状态
 		statusColor := ColorGreen
 		statusText := "正常"
 		if !layer.Status {
@@ -511,10 +596,8 @@ func (nc *NetworkChecker) generateReport() string {
 		}
 		report.WriteString(fmt.Sprintf("状态: %s\n", colorize(statusText, statusColor)))
 
-		// 检测用时
 		report.WriteString(fmt.Sprintf("检测用时: %s\n", colorize(layer.CheckTime.String(), ColorYellow)))
 
-		// 详细信息
 		if len(layer.Details) > 0 {
 			report.WriteString("详细信息:\n")
 			for k, v := range layer.Details {
@@ -541,13 +624,11 @@ func (nc *NetworkChecker) generateReport() string {
 			}
 		}
 
-		// 错误信息
 		if layer.Error != nil {
 			report.WriteString(fmt.Sprintf("错误: %s\n", colorize(layer.Error.Error(), ColorRed)))
 		}
 	}
 
-	// 连接问题
 	if len(nc.status.ConnectionIssues) > 0 {
 		report.WriteString(fmt.Sprintf("\n%s发现的问题%s\n", ColorBold, ColorReset))
 		report.WriteString(fmt.Sprintf("%s%s%s\n", ColorCyan, strings.Repeat("-", 30), ColorReset))
@@ -562,12 +643,10 @@ func (nc *NetworkChecker) generateReport() string {
 func (nc *NetworkChecker) generatePlainReport() string {
 	var report strings.Builder
 
-	// 添加标题
 	report.WriteString("\n网络诊断报告\n")
 	report.WriteString(strings.Repeat("=", 50) + "\n")
 	report.WriteString(fmt.Sprintf("检测时间: %s\n", time.Now().Format("2006-01-02 15:04:05")))
 
-	// 总体状态
 	report.WriteString("\n总体状态\n")
 	report.WriteString(strings.Repeat("-", 30) + "\n")
 	if nc.status.FailedLayer != 0 {
@@ -578,7 +657,6 @@ func (nc *NetworkChecker) generatePlainReport() string {
 	}
 	report.WriteString(fmt.Sprintf("最后成功层级: %s\n", nc.status.LastSuccessLayer.String()))
 
-	// 基础信息
 	report.WriteString("\n基础网络信息\n")
 	report.WriteString(strings.Repeat("-", 30) + "\n")
 	report.WriteString(fmt.Sprintf("本地IP: %s\n", nc.status.LocalIP))
@@ -586,8 +664,9 @@ func (nc *NetworkChecker) generatePlainReport() string {
 	if len(nc.status.DNSServers) > 0 {
 		report.WriteString(fmt.Sprintf("DNS服务器: %s\n", strings.Join(nc.status.DNSServers, ", ")))
 	}
+	report.WriteString(fmt.Sprintf("运营商: %s\n", nc.status.ISPInfo.ISPName))
+	report.WriteString(fmt.Sprintf("公网IP: %s\n", nc.status.ISPInfo.PublicIP))
 
-	// 详细检测结果
 	report.WriteString("\n详细检测结果\n")
 	report.WriteString(strings.Repeat("-", 30) + "\n")
 
@@ -645,25 +724,22 @@ func (nc *NetworkChecker) exportReport(outputDir string) error {
 	timestamp := time.Now().Format("20060102_150405")
 	reportDir := filepath.Join(outputDir, timestamp)
 
-	// 创建输出目录
 	if err := os.MkdirAll(reportDir, 0755); err != nil {
 		return fmt.Errorf("创建输出目录失败: %v", err)
 	}
 
-	// 导出诊断报告
 	reportPath := filepath.Join(reportDir, "network_diagnosis.txt")
 	if err := os.WriteFile(reportPath, []byte(nc.generatePlainReport()), 0644); err != nil {
 		return fmt.Errorf("写入报告文件失败: %v", err)
 	}
 
-	// 导出JSON格式的原始数据
 	jsonData := struct {
 		Timestamp        string
-		Status          NetworkStatus
+		Status           NetworkStatus
 		ConnectionIssues []string
 	}{
 		Timestamp:        timestamp,
-		Status:          nc.status,
+		Status:           nc.status,
 		ConnectionIssues: nc.status.ConnectionIssues,
 	}
 
@@ -739,6 +815,16 @@ func (nc *NetworkChecker) diagnoseNetwork() {
 	}
 	nc.status.LastSuccessLayer = LayerTCP
 
+	ispStatus := nc.checkISP()
+	nc.status.Layers = append(nc.status.Layers, ispStatus)
+	if !ispStatus.Status {
+		nc.status.FailedLayer = LayerISP
+		nc.updateProgress("失败", fmt.Sprintf("运营商检测失败: %v", ispStatus.Error), 100, LogError)
+		nc.updateProgress("报告", nc.generateReport(), 100, LogInfo)
+		return
+	}
+	nc.status.LastSuccessLayer = LayerISP
+
 	internationalStatus := nc.checkInternational()
 	nc.status.Layers = append(nc.status.Layers, internationalStatus)
 	if !internationalStatus.Status {
@@ -806,15 +892,14 @@ func main() {
 
 	checker.diagnoseNetwork()
 
-	// 如果指定了输出目录，则导出报告
 	if *outputDir != "" {
 		if err := checker.exportReport(*outputDir); err != nil {
-			checker.updateProgress("导出", 
+			checker.updateProgress("导出",
 				fmt.Sprintf("%s导出报告失败: %v%s", ColorRed, err, ColorReset),
 				100,
 				LogError)
 		} else {
-			checker.updateProgress("导出", 
+			checker.updateProgress("导出",
 				fmt.Sprintf("%s报告已导出到: %s%s", ColorGreen, *outputDir, ColorReset),
 				100,
 				LogSuccess)
