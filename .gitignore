@@ -1,0 +1,43 @@
+# Go 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试二进制文件
+*.test
+
+# 覆盖率工具产生的文件
+*.out
+
+# 依赖目录
+/vendor/
+
+# Go工作区文件
+go.work
+
+# IDE 相关文件和目录
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 日志文件
+*.log
+
+# 环境变量文件
+.env
+.env.local
+
+# 编译输出目录
+/bin/
+/dist/
+
+# Go调试文件
+__debug_bin
+
+# 项目特定的临时文件
+/tmp/
+/temp/
